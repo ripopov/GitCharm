@@ -165,11 +165,46 @@ class GBranch {
 
 // ─── Color helpers ────────────────────────────────────────────────────────────
 
+/**
+ * Strip the git path prefix from a raw %D token so both short and --decorate=full
+ * forms compare equal: "refs/heads/beta" → "beta", "refs/remotes/origin/beta" →
+ * "origin/beta", "tag: refs/tags/v1" → "v1". Returns null for HEAD / <remote>/HEAD.
+ */
+function shortRefName(raw: string): string | null {
+  let name = raw;
+  if (name.startsWith('HEAD -> ')) name = name.slice('HEAD -> '.length);
+  else if (name === 'HEAD') return null;
+  if (name.startsWith('tag: ')) name = name.slice('tag: '.length);
+  name = name
+    .replace(/^refs\/remotes\//, '')
+    .replace(/^remotes\//, '')
+    .replace(/^refs\/heads\//, '')
+    .replace(/^heads\//, '')
+    .replace(/^refs\/tags\//, '')
+    .replace(/^tags\//, '');
+  if (!name || name === 'HEAD' || name.endsWith('/HEAD')) return null;
+  return name;
+}
+
 function primaryRefName(refs: string[]): string | null {
-  for (const r of refs) { if (r.startsWith('HEAD -> ')) return r.slice('HEAD -> '.length); }
-  for (const r of refs) { if (!r.startsWith('HEAD') && !r.startsWith('tag: ') && !r.includes('/')) return r; }
-  for (const r of refs) { if (!r.startsWith('HEAD') && !r.startsWith('tag: ') && r.includes('/')) return r; }
-  for (const r of refs) { if (r.startsWith('tag: ')) return r.slice('tag: '.length); }
+  // Tokens arrive as --decorate=full ("refs/heads/x", "refs/remotes/origin/x",
+  // "tag: refs/tags/v1"), so classify on the raw prefix rather than on "contains /",
+  // which would lump every full-form ref into the remote bucket.
+  for (const r of refs) { if (r.startsWith('HEAD -> ')) return shortRefName(r); }
+  for (const r of refs) {
+    if (r.startsWith('refs/heads/') || r.startsWith('heads/') ||
+        (!r.startsWith('HEAD') && !r.startsWith('tag: ') && !r.startsWith('refs/') && !r.includes('/'))) {
+      return shortRefName(r);
+    }
+  }
+  for (const r of refs) {
+    if (r.startsWith('refs/remotes/') || r.startsWith('remotes/') ||
+        (!r.startsWith('HEAD') && !r.startsWith('tag: ') && !r.startsWith('refs/') && r.includes('/'))) {
+      const name = shortRefName(r);
+      if (name !== null) return name;
+    }
+  }
+  for (const r of refs) { if (r.startsWith('tag: ') || r.startsWith('refs/tags/')) return shortRefName(r); }
   return null;
 }
 
@@ -185,22 +220,34 @@ function colorForBranch(colourSlot: number, refName: string | null): string {
 
 // ─── Main export ──────────────────────────────────────────────────────────────
 
+/**
+ * @param isFiltered  true when the list is a search result (text / author / date
+ *   filter) rather than a contiguous prefix of history. Parents that are not in the
+ *   loaded set are then dropped instead of being routed off the bottom edge: a
+ *   sparse result set would otherwise open one lane per row, since every commit's
+ *   parent is (almost always) a non-matching commit.
+ *   Must be false for a branch filter — that is still contiguous history, and
+ *   dropping its bottom-edge parents reintroduces the lane shifting on paging that
+ *   keeping them was meant to fix.
+ */
 export function assignLanes(commits: CommitNode[], isFiltered = false): GraphLayout {
-  // In filtered/search mode each result is an isolated node — strip all parent links so
-  // the graph shows only dots with no connecting lines between unrelated results.
   if (commits.length === 0) return { commits: [], segments: [], totalCols: 1, refColors: new Map() };
 
-  // Parents outside the loaded window are deliberately kept. They resolve to the null
-  // vertex below, which holds the branch's column open and runs its line off the bottom
-  // edge — the same thing git-graph does, and what makes the layout stable while paging.
-  // Dropping them instead ends the branch early, returning its column and colour to the
-  // pool for another branch to take; when the next page arrives and the parent shows up,
-  // the branch continues and every allocation after it shifts. On this repo that moved
-  // half the rows already on screen (73 of 150) to a different lane per page loaded.
+  // Parents outside the loaded window are deliberately kept (unless isFiltered). They
+  // resolve to the null vertex below, which holds the branch's column open and runs its
+  // line off the bottom edge — the same thing git-graph does, and what makes the layout
+  // stable while paging. Dropping them instead ends the branch early, returning its
+  // column and colour to the pool for another branch to take; when the next page
+  // arrives and the parent shows up, the branch continues and every allocation after
+  // it shifts. On this repo that moved half the rows already on screen (73 of 150) to
+  // a different lane per page loaded.
 
   const n = commits.length;
+  // Keyed by repo as well as hash: in a multi-repo log two clones (or a fork and its
+  // upstream) share commit hashes, and a parent must resolve within its own repo, not
+  // to whichever repo's copy happened to be indexed last.
   const hashIndex = new Map<string, number>();
-  for (let i = 0; i < n; i++) hashIndex.set(commits[i].hash, i);
+  for (let i = 0; i < n; i++) hashIndex.set(`${commits[i].repoId}\0${commits[i].hash}`, i);
 
   // ── Build vertices ────────────────────────────────────────────────────────
   const nullVertex = new GVertex(NULL_ID);
@@ -208,9 +255,9 @@ export function assignLanes(commits: CommitNode[], isFiltered = false): GraphLay
 
   for (let i = 0; i < n; i++) {
     for (const ph of commits[i].parents) {
-      const pidx = hashIndex.get(ph) ?? -1;
+      const pidx = hashIndex.get(`${commits[i].repoId}\0${ph}`) ?? -1;
       if (pidx >= 0) { vertices[i].addParent(vertices[pidx]); }
-      else vertices[i].addParent(nullVertex);
+      else if (!isFiltered) vertices[i].addParent(nullVertex);
     }
   }
 

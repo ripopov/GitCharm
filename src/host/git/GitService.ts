@@ -483,9 +483,57 @@ export class GitService {
     return branches;
   }
 
+  private static readonly LOG_FORMAT_ARGS = [
+    '--format=%H%x00%h%x00%P%x00%an%x00%ae%x00%ai%x00%ci%x00%D%x00%s', '--decorate=full',
+    '--date=iso-strict', '--abbrev=8',
+  ];
+
+  private parseLogLines(raw: string): CommitNode[] {
+    const commits: CommitNode[] = [];
+    for (const line of raw.trim().split('\n')) {
+      if (!line.trim()) continue;
+      const parts = line.split('\x00');
+      if (parts.length < 9) continue;
+      const [hash, shortHash, parentsRaw, authorName, authorEmail, authorDate, committerDate, refsRaw, message] = parts;
+      commits.push({ hash, shortHash, repoId: this.repoId, message, authorName, authorEmail, authorDate, committerDate, parents: parentsRaw ? parentsRaw.split(' ').filter(Boolean) : [], refs: refsRaw ? refsRaw.split(',').map(r => r.trim()).filter(Boolean) : [] });
+    }
+    return commits;
+  }
+
+  /**
+   * Commits whose hash starts with `prefix`, resolved through the object database
+   * (`rev-parse --disambiguate`) instead of by walking history, so the lookup costs
+   * the same on a ten-commit repo and a million-commit one. When `branch` is set,
+   * only commits reachable from it are returned, so a hash match never surfaces a
+   * commit the active branch filter would hide; otherwise any commit reachable from
+   * some ref qualifies (unreachable objects are not part of the log either).
+   */
+  private async getCommitsByHashPrefix(prefix: string, branch?: string): Promise<CommitNode[]> {
+    const names = (await this.git.raw(['rev-parse', `--disambiguate=${prefix}`]).catch(() => '')).trim();
+    // A very short prefix in a large repo can match hundreds of objects; the per-candidate
+    // checks below are cheap but bound them anyway — past this point the term is clearly
+    // not a hash the user copied from somewhere.
+    const candidates = names.split('\n').map(l => l.trim()).filter(l => /^[0-9a-f]{40,64}$/.test(l)).slice(0, 32);
+    const reachable: string[] = [];
+    for (const h of candidates) {
+      if ((await this.git.raw(['cat-file', '-t', h]).catch(() => '')).trim() !== 'commit') continue;
+      const containing = await this.git.raw(
+        branch
+          ? ['merge-base', '--is-ancestor', h, branch]
+          : ['for-each-ref', '--count=1', '--format=%(refname)', `--contains=${h}`, 'refs/heads/', 'refs/remotes/', 'refs/tags/'],
+      ).catch(() => null);
+      // merge-base exits non-zero (→ null) when not an ancestor; for-each-ref prints nothing.
+      if (containing === null || (!branch && !containing.trim())) continue;
+      reachable.push(h);
+    }
+    if (reachable.length === 0) return [];
+    const raw = await this.git.raw(['log', '--no-walk=unsorted', ...GitService.LOG_FORMAT_ARGS, ...reachable, '--']).catch(() => '');
+    return this.parseLogLines(raw);
+  }
+
   // Log uses raw git format for graph rendering — VS Code API's log() lacks graph parents/refs.
   async getLog(limit: number, skip: number, opts?: { filterText?: string; filterAuthor?: string; filterBranch?: string; filterDateFrom?: string; filterDateTo?: string; worktreeServices?: GitService[] }): Promise<CommitNode[]> {
-    const isHashSearch = opts?.filterText && /^[0-9a-f]{4,40}$/i.test(opts.filterText.trim());
+    const filterText = opts?.filterText?.trim() || undefined;
     const args: string[] = [
       'log',
       // --date-order, not --topo-order: the log renders in committer-date order (see
@@ -493,33 +541,38 @@ export class GitService {
       // meant a page's contents depended on where its boundaries fell. Date order is
       // still topological — a commit never precedes its own parent.
       '--date-order',
-      // Hash search scans the full history without pagination — result is always a single commit
-      ...(isHashSearch ? ['--max-count=50000'] : [`--max-count=${limit}`, `--skip=${skip}`]),
-      '--format=%H%x00%h%x00%P%x00%an%x00%ae%x00%ai%x00%ci%x00%D%x00%s', '--decorate=full',
-      '--date=iso-strict', '--abbrev=8',
+      `--max-count=${limit}`, `--skip=${skip}`,
+      ...GitService.LOG_FORMAT_ARGS,
     ];
-    if (opts?.filterText && !isHashSearch) args.push(`--grep=${opts.filterText}`, '--regexp-ignore-case');
-    if (opts?.filterAuthor) args.push(`--author=${opts.filterAuthor}`, '--regexp-ignore-case');
+    // Text and author are plain case-insensitive substring matches (the JetBrains
+    // default — regex is an opt-in there). Without --fixed-strings a search such as
+    // "fix [WIP]" is a malformed regex and git fails the whole request.
+    if (filterText || opts?.filterAuthor) args.push('--fixed-strings', '--regexp-ignore-case');
+    if (filterText) args.push(`--grep=${filterText}`);
+    if (opts?.filterAuthor) args.push(`--author=${opts.filterAuthor}`);
     if (opts?.filterDateFrom) args.push(`--after=${opts.filterDateFrom}`);
     if (opts?.filterDateTo) args.push(`--before=${opts.filterDateTo}`);
-    if (isHashSearch) {
-      // Hash search: scan full history, filter by prefix match after fetching
-      args.push('--exclude=refs/stash', '--all');
-    } else if (opts?.filterBranch) {
+    if (opts?.filterBranch) {
       args.push(opts.filterBranch);
     } else {
       args.push('--exclude=refs/stash', '--all');
     }
-    const raw = await this.git.raw(args);
-    const hashPrefix = isHashSearch ? opts!.filterText!.trim().toLowerCase() : null;
-    const commits: CommitNode[] = [];
-    for (const line of raw.trim().split('\n')) {
-      if (!line.trim()) continue;
-      const parts = line.split('\x00');
-      if (parts.length < 9) continue;
-      const [hash, shortHash, parentsRaw, authorName, authorEmail, authorDate, committerDate, refsRaw, message] = parts;
-      if (hashPrefix && !hash.toLowerCase().startsWith(hashPrefix)) continue;
-      commits.push({ hash, shortHash, repoId: this.repoId, message, authorName, authorEmail, authorDate, committerDate, parents: parentsRaw ? parentsRaw.split(' ').filter(Boolean) : [], refs: refsRaw ? refsRaw.split(',').map(r => r.trim()).filter(Boolean) : [] });
+    // Terminate revisions: a branch that shares its name with a path in the working
+    // tree ("docs", "build") is otherwise rejected by git as ambiguous.
+    args.push('--');
+
+    // A hash-looking search term is also looked up as a hash prefix, alongside the
+    // message match — "cafe" or "feed" is a real word as well as a valid prefix, and
+    // JetBrains matches both. Hash hits come first; the walk below is unaffected.
+    const isHashSearch = !!filterText && /^[0-9a-f]{4,64}$/i.test(filterText);
+    const [raw, hashHits] = await Promise.all([
+      this.git.raw(args),
+      isHashSearch ? this.getCommitsByHashPrefix(filterText!.toLowerCase(), opts?.filterBranch) : Promise.resolve([]),
+    ]);
+    const commits = this.parseLogLines(raw);
+    if (hashHits.length > 0) {
+      const seen = new Set(hashHits.map(c => c.hash));
+      commits.splice(0, commits.length, ...hashHits, ...commits.filter(c => !seen.has(c.hash)));
     }
 
     // Mark unpushed commits: hashes ahead of the remote tracking branch.
