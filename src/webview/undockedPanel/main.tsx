@@ -221,8 +221,10 @@ function LogApp() {
     return map;
   }, [store.repos]);
 
+  // A search result set (not contiguous history) — see assignLanes. The branch
+  // filter is deliberately excluded: it is still a contiguous walk of one ref.
   const isFiltered = !!(
-    store.commitFilters.text || store.commitFilters.author || store.commitFilters.branch ||
+    store.commitFilters.text || store.commitFilters.author ||
     store.commitFilters.dateFrom || store.commitFilters.dateTo
   );
 
