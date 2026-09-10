@@ -246,10 +246,14 @@ export class GitLogPanelProvider implements vscode.WebviewViewProvider, vscode.D
     this.managerListeners.push(
       this.manager.onGraphChange(onGraphOrBranchChange),
       this.manager.onBranchChange(onGraphOrBranchChange),
-      // The repo set is rebuilt for reasons that leave it as it was (a settings
-      // edit, VS Code's git extension opening a repo late). Restarting the commit
-      // request then only discards the one already in flight.
-      this.manager.onReposChange(() => { if (this.visibleReposChanged()) onGraphOrBranchChange(); })
+      // The repo set is often rebuilt without changing (a settings edit, VS Code's
+      // git extension opening a repo late). Repo metadata such as colors may still
+      // differ, so the init data always goes out; restarting the commit request
+      // would only discard the one in flight, so that waits for a real change.
+      this.manager.onReposChange(() => {
+        if (this.visibleReposChanged()) this.broadcast({ type: 'LOG_REFRESH' });
+        void this.pushInitData();
+      })
     );
 
     this.profileService?.onProfileChange(async () => {
