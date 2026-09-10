@@ -3,18 +3,24 @@ import * as path from 'path';
 import type { WorkspaceGitManager } from '../git/WorkspaceGitManager';
 import { showGitError } from '../utils/gitErrorUtils';
 import { logWarn } from '../utils/Logger';
-
-const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+import { EMPTY_TREE } from '../git/zipChanges';
 
 function gitUri(rootPath: string, ref: string, filePath: string): vscode.Uri {
   const fileUri = vscode.Uri.file(path.join(rootPath, filePath));
   return vscode.Uri.from({ scheme: 'git', path: fileUri.path, query: JSON.stringify({ path: fileUri.fsPath, ref }) });
 }
 
+/**
+ * Open the diff of one row of a multi-commit selection: `oldPath ?? filePath` at
+ * `beforeRef` against `filePath` at `afterRef` (see SelectionFile). For a
+ * contiguous selection both refs are the range endpoints; for a folded selection
+ * they are the earliest change's parent and the latest change's commit.
+ */
 export async function openRangeFileDiff(
   manager: WorkspaceGitManager,
   repoId: string,
-  hashes: string[],
+  beforeRef: string,
+  afterRef: string,
   filePath: string,
   status?: string,
   oldPath?: string,
@@ -26,14 +32,11 @@ export async function openRangeFileDiff(
   }
 
   try {
-    const ordered = await repo.getCombinedFilesOrder(hashes);
-    const oldest = ordered[0];
-    const newest = ordered[ordered.length - 1];
-    if (!oldest || !newest) return;
     const originalPath = oldPath ?? filePath;
-    const original = gitUri(repo.rootPath, status === 'A' ? EMPTY_TREE : oldest, originalPath);
-    const modified = gitUri(repo.rootPath, status === 'D' ? EMPTY_TREE : newest, filePath);
-    const title = `${path.basename(filePath)} (${oldest.slice(0, 7)}…${newest.slice(0, 7)})`;
+    const original = gitUri(repo.rootPath, status === 'A' ? EMPTY_TREE : beforeRef, originalPath);
+    const modified = gitUri(repo.rootPath, status === 'D' ? EMPTY_TREE : afterRef, filePath);
+    const label = (ref: string) => ref === EMPTY_TREE ? '∅' : ref.slice(0, 7);
+    const title = `${path.basename(filePath)} (${label(beforeRef)}…${label(afterRef)})`;
     await vscode.commands.executeCommand('vscode.diff', original, modified, title);
   } catch (e: unknown) {
     showGitError('rangeDiff', e);

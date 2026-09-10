@@ -572,18 +572,15 @@ export class GitLogPanelProvider implements vscode.WebviewViewProvider, vscode.D
         break;
       }
 
-      case 'LOG_REQUEST_RANGE_FILES': {
+      case 'LOG_REQUEST_SELECTION_FILES': {
         const repo = this.manager.getRepo(msg.repoId);
-        if (!repo) { this.post({ type: 'LOG_RANGE_FILES_RESULT', requestId: msg.requestId, files: [], orderedHashes: [], error: 'Repo not found' }); return; }
+        if (!repo) { this.post({ type: 'LOG_SELECTION_FILES_RESULT', requestId: msg.requestId, files: [], contiguous: false, error: 'Repo not found' }); return; }
         try {
-          const [files, orderedHashes] = await Promise.all([
-            repo.getFilesBetween(msg.hashes),
-            repo.getCombinedFilesOrder(msg.hashes),
-          ]);
-          this.post({ type: 'LOG_RANGE_FILES_RESULT', requestId: msg.requestId, files, orderedHashes });
+          const { files, contiguous } = await repo.getSelectionFiles(msg.hashes);
+          this.post({ type: 'LOG_SELECTION_FILES_RESULT', requestId: msg.requestId, files, contiguous });
         } catch (e: unknown) {
-          logError('rangeFiles', formatGitError(e), getRawErrorDetail(e));
-          this.post({ type: 'LOG_RANGE_FILES_RESULT', requestId: msg.requestId, files: [], orderedHashes: [], error: formatGitError(e) });
+          logError('selectionFiles', formatGitError(e), getRawErrorDetail(e));
+          this.post({ type: 'LOG_SELECTION_FILES_RESULT', requestId: msg.requestId, files: [], contiguous: false, error: formatGitError(e) });
         }
         break;
       }
@@ -627,7 +624,7 @@ export class GitLogPanelProvider implements vscode.WebviewViewProvider, vscode.D
 
       case 'LOG_OPEN_RANGE_FILE_DIFF': {
         const { openRangeFileDiff } = await import('./CombinedDiffPanel');
-        await openRangeFileDiff(this.manager, msg.repoId, msg.hashes, msg.filePath, msg.fileStatus, msg.oldPath);
+        await openRangeFileDiff(this.manager, msg.repoId, msg.beforeRef, msg.afterRef, msg.filePath, msg.fileStatus, msg.oldPath);
         break;
       }
 

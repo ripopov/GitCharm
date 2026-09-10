@@ -8,6 +8,7 @@ import type {
   WorkspaceStatus,
 } from './git';
 import type { WorktreeEntry } from '../git/WorkspaceGitManager';
+import type { SelectionFile } from '../git/zipChanges';
 import type { IconThemeData } from '../utils/IconThemeService';
 import type { ViewAndSortSettings, ViewAndSortUserPrefs } from './settings';
 
@@ -199,7 +200,7 @@ export type CommitToHostMsg =
 
 // ─── Git Log: Host → WebView ─────────────────────────────────────────────────
 
-export type { IconThemeData };
+export type { IconThemeData, SelectionFile };
 
 export interface TagInfo {
   name: string;
@@ -213,7 +214,7 @@ export type HostToLogMsg =
   | { type: 'LOG_COMMITS_BATCH'; commits: CommitNode[]; isLast: boolean; batchIndex: number; requestId?: string }
   | { type: 'LOG_DIFF_RESULT'; requestId: string; files: Array<{ path: string; status: string }>; diff: FileDiff | null; error?: string }
   | { type: 'LOG_COMMIT_FILES'; requestId: string; files: Array<{ path: string; status: string; added?: number; removed?: number; oldPath?: string }>; error?: string }
-  | { type: 'LOG_RANGE_FILES_RESULT'; requestId: string; files: Array<{ path: string; status: string; added?: number; removed?: number; oldPath?: string }>; orderedHashes: string[]; error?: string }
+  | { type: 'LOG_SELECTION_FILES_RESULT'; requestId: string; files: SelectionFile[]; contiguous: boolean; error?: string }
   | { type: 'LOG_BRANCH_OP_RESULT'; requestId: string; ok: boolean; output?: string; error?: string }
   | { type: 'LOG_REFS_UPDATE'; repoId: string; branches: BranchInfo[] }
   | { type: 'LOG_TAGS_UPDATE'; repoId: string; tags: TagInfo[] }
@@ -235,10 +236,12 @@ export type HostToLogMsg =
 export type LogToHostMsg =
   | { type: 'LOG_REQUEST_COMMITS'; repoIds: string[]; limit: number; skip: number; requestId?: string; filterText?: string; filterAuthor?: string; filterBranch?: string; filterDateFrom?: string; filterDateTo?: string }
   | { type: 'LOG_REQUEST_COMMIT_FILES'; requestId: string; repoId: string; hash: string; parents?: string[] }
-  | { type: 'LOG_REQUEST_RANGE_FILES'; requestId: string; repoId: string; hashes: string[] }
+  /** `hashes` in log (newest first) order. */
+  | { type: 'LOG_REQUEST_SELECTION_FILES'; requestId: string; repoId: string; hashes: string[] }
   | { type: 'LOG_REQUEST_FILE_DIFF'; requestId: string; repoId: string; hash: string; filePath: string }
   | { type: 'LOG_OPEN_FILE_DIFF'; repoId: string; hash: string; filePath: string; fileStatus?: string; oldPath?: string; parents?: string[]; combined?: boolean }
-  | { type: 'LOG_OPEN_RANGE_FILE_DIFF'; repoId: string; hashes: string[]; filePath: string; fileStatus?: string; oldPath?: string }
+  /** Diff `oldPath ?? filePath` at `beforeRef` against `filePath` at `afterRef` (a SelectionFile row). */
+  | { type: 'LOG_OPEN_RANGE_FILE_DIFF'; repoId: string; beforeRef: string; afterRef: string; filePath: string; fileStatus?: string; oldPath?: string }
   | { type: 'LOG_OPEN_FILE'; repoId: string; filePath: string }
   | { type: 'LOG_REVERT_FILE'; requestId: string; repoId: string; hash: string; filePath: string; fileStatus?: string }
   | { type: 'LOG_CHERRY_PICK_FILE'; requestId: string; repoId: string; hash: string; filePath: string; oldPath?: string }

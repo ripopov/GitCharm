@@ -11,8 +11,9 @@ import { ResizeHandle } from '../shared/ResizeHandle';
 import { useResize } from '../shared/useResize';
 import { Codicon } from '../shared/Codicon';
 import { getVsCodeApi } from '../shared/vscodeApi';
-import type { LogToHostMsg, HostToLogMsg } from '../../host/types/messages';
+import type { LogToHostMsg, HostToLogMsg, SelectionFile } from '../../host/types/messages';
 import type { CommitNode } from '../shared/types';
+import type { CommitSelection } from './components/CommitDetail';
 
 function generateId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -23,6 +24,10 @@ function generateId() {
 // so there is nothing to bound here.
 const PAGE_SIZE = 150;
 
+// Largest multi-selection whose combined changes are computed (JetBrains'
+// VcsLogUtil.MAX_SELECTED_COMMITS). Larger selections show a notice instead.
+export const MAX_SELECTED_COMMITS = 1000;
+
 
 function App() {
   const store = useLogStore();
@@ -32,11 +37,12 @@ function App() {
   const [detailCollapsed, setDetailCollapsed] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [themeVersion, setThemeVersion] = useState(0);
+  // Ctrl/Shift multi-selection, in list (newest first) order.
   const [multiSelectedCommits, setMultiSelectedCommits] = useState<CommitNode[]>([]);
-  const [rangeEndpoints, setRangeEndpoints] = useState<{ older: CommitNode; newer: CommitNode } | null>(null);
-  const [rangeFiles, setRangeFiles] = useState<Array<{ path: string; status: string; added?: number; removed?: number; oldPath?: string }>>([]);
-  const [loadingRangeFiles, setLoadingRangeFiles] = useState(false);
-  const rangeRequestKeyRef = useRef('');
+  const [selectionFiles, setSelectionFiles] = useState<SelectionFile[]>([]);
+  const [selectionContiguous, setSelectionContiguous] = useState(false);
+  const [loadingSelectionFiles, setLoadingSelectionFiles] = useState(false);
+  const selectionRequestKeyRef = useRef('');
 
   useEffect(() => {
     const obs = new MutationObserver(() => setThemeVersion(v => v + 1));
@@ -64,45 +70,44 @@ function App() {
     });
   }, []);
 
-  const selectedRangeKey = multiSelectedCommits.length === 2
-    ? `${multiSelectedCommits[0].repoId}:${multiSelectedCommits.map(c => c.hash).sort().join(':')}`
+  // Two or more commits selected → the detail panel shows their combined changes.
+  const selectedCommits = multiSelectedCommits.length >= 2 ? multiSelectedCommits : null;
+  const selectionKey = selectedCommits
+    ? `${selectedCommits[0].repoId}:${selectedCommits.map(c => c.hash).join(':')}`
     : '';
-  rangeRequestKeyRef.current = selectedRangeKey;
+  selectionRequestKeyRef.current = selectionKey;
 
   useEffect(() => {
-    if (!selectedRangeKey || multiSelectedCommits.length !== 2) {
-      setRangeEndpoints(null);
-      setRangeFiles([]);
-      setLoadingRangeFiles(false);
-      return;
-    }
-
-    const selectedByHash = new Map(multiSelectedCommits.map(c => [c.hash, c]));
-    const fallback = [...multiSelectedCommits].sort(
-      (a, b) => new Date(a.committerDate).getTime() - new Date(b.committerDate).getTime(),
-    );
-    setRangeEndpoints({ older: fallback[0], newer: fallback[1] });
-    setRangeFiles([]);
-    setLoadingRangeFiles(true);
+    setSelectionFiles([]);
+    setSelectionContiguous(false);
+    setLoadingSelectionFiles(false);
+    if (!selectionKey || !selectedCommits) return;
     useLogStore.getState().selectFile(null);
+    if (selectedCommits.length > MAX_SELECTED_COMMITS) return;
 
-    request<Extract<HostToLogMsg, { type: 'LOG_RANGE_FILES_RESULT' }>>({
-      type: 'LOG_REQUEST_RANGE_FILES',
+    setLoadingSelectionFiles(true);
+    request<Extract<HostToLogMsg, { type: 'LOG_SELECTION_FILES_RESULT' }>>({
+      type: 'LOG_REQUEST_SELECTION_FILES',
       requestId: '',
-      repoId: multiSelectedCommits[0].repoId,
-      hashes: multiSelectedCommits.map(c => c.hash),
+      repoId: selectedCommits[0].repoId,
+      hashes: selectedCommits.map(c => c.hash),
     }).then(msg => {
-      if (rangeRequestKeyRef.current !== selectedRangeKey) return;
-      const ordered = msg.orderedHashes.map(hash => selectedByHash.get(hash)).filter((c): c is CommitNode => !!c);
-      if (ordered.length === 2) setRangeEndpoints({ older: ordered[0], newer: ordered[1] });
-      setRangeFiles(msg.files);
-      setLoadingRangeFiles(false);
+      if (selectionRequestKeyRef.current !== selectionKey) return;
+      setSelectionFiles(msg.files);
+      setSelectionContiguous(msg.contiguous);
+      setLoadingSelectionFiles(false);
     });
-  }, [selectedRangeKey, request]);
+  }, [selectionKey, request]);
+
+  const selection = useMemo((): CommitSelection | null => selectedCommits
+    ? { commits: selectedCommits, contiguous: selectionContiguous, maxCommits: MAX_SELECTED_COMMITS }
+    : null,
+  // selectionKey stands in for selectedCommits' contents.
+  [selectionKey, selectionContiguous]);
 
   const handleMultiSelectionChange = useCallback((commits: CommitNode[]) => {
     setMultiSelectedCommits(commits);
-    if (commits.length === 2) setDetailCollapsed(false);
+    if (commits.length >= 2) setDetailCollapsed(false);
   }, []);
 
   useEffect(() => {
@@ -343,8 +348,8 @@ function App() {
     return map;
   }, [store.branches]);
 
-  const selectedRepoColor = rangeEndpoints
-    ? repoColors[rangeEndpoints.newer.repoId]
+  const selectedRepoColor = selection
+    ? repoColors[selection.commits[0].repoId]
     : store.selectedCommit
       ? repoColors[store.selectedCommit.repoId]
       : undefined;
@@ -391,7 +396,7 @@ function App() {
     [store.tags, activeRepoId]
   );
 
-  const hasSelectedCommit = !!store.selectedCommit || !!rangeEndpoints;
+  const hasSelectedCommit = !!store.selectedCommit || !!selection;
 
   const showNoRepo = store.repos.length === 0 && store.initialized;
   const noRepoOverlay = showNoRepo ? (
@@ -543,11 +548,11 @@ function App() {
         {hasSelectedCommit && !detailCollapsed && (
           <div ref={detailRef} style={detailPane}>
             <CommitDetail
-              commit={rangeEndpoints?.newer ?? store.selectedCommit}
-              range={rangeEndpoints ?? undefined}
-              files={rangeEndpoints ? rangeFiles : store.commitFiles}
+              commit={selection ? selection.commits[0] : store.selectedCommit}
+              selection={selection ?? undefined}
+              files={selection ? selectionFiles : store.commitFiles}
               selectedFile={store.selectedFile}
-              loadingFiles={rangeEndpoints ? loadingRangeFiles : store.loadingFiles}
+              loadingFiles={selection ? loadingSelectionFiles : store.loadingFiles}
               repoColor={selectedRepoColor}
               repos={store.repos}
               iconTheme={store.iconTheme}
