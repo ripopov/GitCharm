@@ -220,9 +220,24 @@ export class GitLogPanelProvider implements vscode.WebviewViewProvider, vscode.D
     void this.handleMessage(msg, 'undocked').catch(e => this.handleMessageFailure(msg, 'undocked', e));
   }
 
+  /** Identity of the repo set last sent to the webview, to skip refreshes that would not change it. */
+  private lastVisibleRepoKey: string | undefined;
+
+  private visibleRepoKey(repos: Array<{ id: string }>): string {
+    return repos.map(r => r.id).join('\0');
+  }
+
+  private visibleReposChanged(): boolean {
+    const key = this.visibleRepoKey(this.getVisibleRepos());
+    if (key === this.lastVisibleRepoKey) return false;
+    this.lastVisibleRepoKey = key;
+    return true;
+  }
+
   /** Re-query repos and branches and push them to the webview. */
   private async pushInitData(): Promise<void> {
     const repos = await this.getVisibleReposWithDefaultBranch();
+    this.lastVisibleRepoKey = this.visibleRepoKey(repos);
     const branches = await this.getFilteredBranches();
     await this.refreshActiveProfile();
     this.broadcast({ type: 'LOG_INIT_DATA', repos, branches });
@@ -253,7 +268,10 @@ export class GitLogPanelProvider implements vscode.WebviewViewProvider, vscode.D
     this.managerListeners.push(
       this.manager.onGraphChange(onGraphOrBranchChange),
       this.manager.onBranchChange(onGraphOrBranchChange),
-      this.manager.onReposChange(onGraphOrBranchChange)
+      // The repo set is rebuilt for reasons that leave it as it was (a settings
+      // edit, VS Code's git extension opening a repo late). Restarting the commit
+      // request then only discards the one already in flight.
+      this.manager.onReposChange(() => { if (this.visibleReposChanged()) onGraphOrBranchChange(); })
     );
 
     this.profileService?.onProfileChange(async () => {
@@ -610,6 +628,7 @@ export class GitLogPanelProvider implements vscode.WebviewViewProvider, vscode.D
           this.getFilteredBranches(),
           iconWebview ? loadIconTheme(iconWebview) : Promise.resolve(undefined),
         ]);
+        this.lastVisibleRepoKey = this.visibleRepoKey(repos);
         post({ type: 'LOG_INIT_DATA', repos, branches, iconTheme });
 
         // Send tags for all repos

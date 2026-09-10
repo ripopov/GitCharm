@@ -21,6 +21,8 @@ const INHERITED_ENV_ALLOWANCES: Partial<SimpleGitOptions['unsafe']> = Object.fro
 
 export function createGit(baseDir?: string, options: Partial<SimpleGitOptions> = {}): SimpleGit {
   const git = simpleGit({
+    // Avoid index refresh writes that trigger watcher loops in submodules.
+    binary: ['git', '--no-optional-locks'],
     ...options,
     ...(baseDir !== undefined ? { baseDir } : {}),
     // By default git prints non-ASCII paths quoted and octal-escaped ("\350\257\264.txt"),
