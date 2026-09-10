@@ -126,12 +126,22 @@ function FileContextMenu({ x, y, onShowDiff, onShowCombinedDiff, onEditSource, o
   );
 }
 
+/** A multi-commit selection whose combined changes the panel shows. */
+export interface CommitSelection {
+  /** Selected commits in log (newest first) order. */
+  commits: CommitNode[];
+  /** True when the host diffed one first-parent range instead of folding per-commit changes. */
+  contiguous: boolean;
+  /** Selections larger than this are not computed; the panel shows a notice instead. */
+  maxCommits: number;
+}
+
 interface Props {
   commit: CommitNode | null;
   /** Full (multi-line) commit message body — only used in twoColumnLayout mode's expanded "Commit message" section. Falls back to `commit.message` (subject only) when omitted. */
   fullMessage?: string;
-  range?: { older: CommitNode; newer: CommitNode };
-  files: Array<{ path: string; status: string; added?: number; removed?: number; oldPath?: string }>;
+  selection?: CommitSelection;
+  files: FileEntry[];
   selectedFile: { path: string; status: string } | null;
   loadingFiles: boolean;
   repoColor?: string;
@@ -159,7 +169,7 @@ const STATUS_COLORS: Record<string, string> = {
   C: 'var(--vscode-gitDecoration-addedResourceForeground)',
 };
 
-interface FileEntry { path: string; status: string; added?: number; removed?: number; oldPath?: string; }
+interface FileEntry { path: string; status: string; added?: number; removed?: number; oldPath?: string; beforeRef?: string; afterRef?: string; }
 
 function statusColor(status: string): string {
   return STATUS_COLORS[status] ?? 'var(--vscode-foreground)';
@@ -204,7 +214,7 @@ function RefBadgeIcon({ group }: { group: RefGroup }) {
 
 /* ─── Main component ──────────────────────────────────────────────────────── */
 
-export function CommitDetail({ commit, fullMessage, range, files, selectedFile, loadingFiles, repoColor, repos, iconTheme, onSelectFile, onClose, refColors, activeProfile, hideExtendedDetailButton, twoColumnLayout }: Props) {
+export function CommitDetail({ commit, fullMessage, selection, files, selectedFile, loadingFiles, repoColor, repos, iconTheme, onSelectFile, onClose, refColors, activeProfile, hideExtendedDetailButton, twoColumnLayout }: Props) {
   // Same id/rule as CommitList.tsx's injection — that component isn't always mounted alongside
   // this one (e.g. the standalone "Full Detail" panel), so this component injects its own copy
   // of the [data-top-action-btn] hover rule its own toolbar buttons rely on. The shared id makes
@@ -256,19 +266,20 @@ export function CommitDetail({ commit, fullMessage, range, files, selectedFile, 
   const [descendantsExpanded, setDescendantsExpanded] = useState(false);
 
   const repoName = useMemo(() => {
-    const activeCommit = range?.newer ?? commit;
+    const activeCommit = selection?.commits[0] ?? commit;
     if (!activeCommit) return null;
     return repos.find(r => r.id === activeCommit.repoId)?.name ?? null;
-  }, [commit, range, repos]);
+  }, [commit, selection, repos]);
   // A repo color only helps tell repos apart — with a single repo in the workspace
   // there's nothing to distinguish it from, so the name stays in the plain foreground color.
   const effectiveRepoColor = repos.length > 1 ? repoColor : undefined;
 
   // A stash entry has 2-3 parents (base + index + untracked commits) but is never a
   // real merge — never show the Merged Commits section for one.
-  const isMerge = !range && !commit?.isStash && (commit?.parents.length ?? 0) >= 2;
-  // Shown only once the list has loaded — a "(0)" while loading would read as "no commits".
+  // Effects below only care whether a selection is active, not which one.
   const mergeCountSuffix = !loadingMerge && mergeCommits.length > 0 ? ` (${mergeCommits.length})` : '';
+  const inSelection = !!selection;
+  const isMerge = !inSelection && !commit?.isStash && (commit?.parents.length ?? 0) >= 2;
 
   // Only refs that point AT this commit — never branches that merely contain it.
   // Order: HEAD, tags, primary locals, other locals, primary remotes, other remotes.
@@ -319,7 +330,7 @@ export function CommitDetail({ commit, fullMessage, range, files, selectedFile, 
     return () => window.removeEventListener('message', handler);
   }, []);
 
-  useEffect(() => { setRefsExpanded(false); }, [commit?.hash, range]);
+  useEffect(() => { setRefsExpanded(false); }, [commit?.hash, inSelection]);
 
   // Descendant branches/tags — those that contain this commit without pointing at it
   // directly — are fetched separately from the exact-match refs shown as badges above,
@@ -327,7 +338,7 @@ export function CommitDetail({ commit, fullMessage, range, files, selectedFile, 
   // Full Detail only — the Log Panel's compact commit detail hides this section entirely.
   useEffect(() => {
     setDescendantsExpanded(false);
-    if (!twoColumnLayout || range || !commit || commit.isStash) { setDescendantBranches({ local: [], remote: [], tags: [] }); setLoadingDescendants(false); return; }
+    if (!twoColumnLayout || inSelection || !commit || commit.isStash) { setDescendantBranches({ local: [], remote: [], tags: [] }); setLoadingDescendants(false); return; }
     setLoadingDescendants(true);
     const reqId = generateId();
     pendingRef.current.set(reqId, (msg) => {
@@ -342,13 +353,13 @@ export function CommitDetail({ commit, fullMessage, range, files, selectedFile, 
       repoId: commit.repoId,
       hash: commit.hash,
     } satisfies LogToHostMsg);
-  }, [commit?.hash, range, twoColumnLayout]);
+  }, [commit?.hash, inSelection, twoColumnLayout]);
 
   useEffect(() => {
     setExpandedMergeHash(null);
     setMergeCommitFiles({});
     setMergeCommitFilesLoading({});
-    if (range || !commit || !isMerge || commit.isStash) { setMergeCommits([]); return; }
+    if (inSelection || !commit || !isMerge || commit.isStash) { setMergeCommits([]); return; }
     setLoadingMerge(true);
     const reqId = generateId();
     pendingRef.current.set(reqId, (msg) => {
@@ -364,15 +375,18 @@ export function CommitDetail({ commit, fullMessage, range, files, selectedFile, 
       hash: commit.hash,
       parents: commit.parents,
     } satisfies LogToHostMsg);
-  }, [commit?.hash, range]);
+  }, [commit?.hash, inSelection]);
 
   function openVscodeDiff(file: FileEntry, hash?: string, combined?: boolean) {
     onSelectFile(file);
-    if (range) {
+    if (selection) {
+      // Rows of a selection carry the revisions to diff (see SelectionFile).
+      if (!file.beforeRef || !file.afterRef) return;
       getVsCodeApi().postMessage({
         type: 'LOG_OPEN_RANGE_FILE_DIFF',
-        repoId: range.newer.repoId,
-        hashes: [range.older.hash, range.newer.hash],
+        repoId: selection.commits[0].repoId,
+        beforeRef: file.beforeRef,
+        afterRef: file.afterRef,
         filePath: file.path,
         fileStatus: file.status,
         oldPath: file.oldPath,
@@ -501,6 +515,7 @@ export function CommitDetail({ commit, fullMessage, range, files, selectedFile, 
   const activeFiles = files;
   const activeLoading = loadingFiles;
   const activeHash = commit?.hash;
+  const tooManySelected = !!selection && selection.commits.length > selection.maxCommits;
 
   return (
     <div
@@ -510,7 +525,7 @@ export function CommitDetail({ commit, fullMessage, range, files, selectedFile, 
     >
       {!twoColumnLayout && (
       <div style={styles.topActions}>
-        {!range && (
+        {!selection && (
           <>
             <button
               data-top-action-btn=""
@@ -544,26 +559,40 @@ export function CommitDetail({ commit, fullMessage, range, files, selectedFile, 
         className={twoColumnLayout ? 'commit-detail-two-column-header' : undefined}
         style={twoColumnLayout ? styles.headerTwoColumn : styles.header}
       >
-        {range ? (
-          <>
-            {repoName && (
-              <div style={styles.repoRow}>
-                <Codicon name="repo" style={styles.repoIcon} />
-                <span style={styles.repoName(effectiveRepoColor)}>{repoName}</span>
+        {selection ? (() => {
+          const newest = selection.commits[0];
+          const oldest = selection.commits[selection.commits.length - 1];
+          const hint = tooManySelected
+            ? `Too many commits selected — at most ${selection.maxCommits} can be shown together.`
+            : selection.contiguous
+              ? 'Changes between the oldest selected commit\'s parent and the newest commit'
+              : 'Changes of each selected commit, combined per file';
+          return (
+            <>
+              {repoName && (
+                <div style={styles.repoRow}>
+                  <Codicon name="repo" style={styles.repoIcon} />
+                  <span style={styles.repoName(effectiveRepoColor)}>{repoName}</span>
+                </div>
+              )}
+              <div style={styles.rangeTitle}>
+                <Codicon name="diff-multiple" style={{ fontSize: '14px', opacity: 0.8 }} />
+                <span>{selection.commits.length} commits selected</span>
               </div>
-            )}
-            <div style={styles.rangeTitle}>
-              <Codicon name="diff-multiple" style={{ fontSize: '14px', opacity: 0.8 }} />
-              <span>{l10n.t('Compare commits')}</span>
-            </div>
-            <div style={styles.hashRow}>
-              <span style={styles.hash}>{range.older.shortHash}</span>
-              <Codicon name="arrow-right" style={{ fontSize: '11px', opacity: 0.6 }} />
-              <span style={styles.hash}>{range.newer.shortHash}</span>
-            </div>
-            <div style={styles.rangeHint}>{l10n.t('Changes between the selected snapshots')}</div>
-          </>
-        ) : (
+              <div style={styles.hashRow}>
+                <span style={styles.rangeLabel}>newest</span>
+                <span style={styles.hash}>{newest.shortHash}</span>
+                <span style={styles.rangeMessage} title={newest.message}>{newest.message}</span>
+              </div>
+              <div style={styles.hashRow}>
+                <span style={styles.rangeLabel}>oldest</span>
+                <span style={styles.hash}>{oldest.shortHash}</span>
+                <span style={styles.rangeMessage} title={oldest.message}>{oldest.message}</span>
+              </div>
+              <div style={styles.rangeHint}>{hint}</div>
+            </>
+          );
+        })() : (
           <>
             {repoName && !twoColumnLayout && (
               <div style={styles.repoRow}>
@@ -871,7 +900,7 @@ export function CommitDetail({ commit, fullMessage, range, files, selectedFile, 
       >
       {/* File list toolbar */}
       <div style={styles.fileListToolbar}>
-        {twoColumnLayout && !range && (
+        {twoColumnLayout && !inSelection && (
           <button
             data-top-action-btn=""
             style={styles.toggleBtn(false, twoColumnLayout)}
@@ -923,7 +952,7 @@ export function CommitDetail({ commit, fullMessage, range, files, selectedFile, 
       </div>
 
       {/* File context menu */}
-      {ctxMenu && commit && !range && (
+      {ctxMenu && commit && !selection && (
         <FileContextMenu
           x={ctxMenu.x}
           y={ctxMenu.y}
@@ -946,7 +975,9 @@ export function CommitDetail({ commit, fullMessage, range, files, selectedFile, 
       <div style={styles.fileList} onKeyDown={(e) => handleTreeNavKeyDown(e, e.currentTarget)}>
         {activeLoading && <div style={styles.loading}>{l10n.t('Loading files...')}</div>}
         {!activeLoading && activeFiles.length === 0 && (
-          <div style={styles.loading}>{l10n.t('No changed files')}</div>
+          <div style={styles.loading}>
+            {tooManySelected ? `Select at most ${selection!.maxCommits} commits to see their changes` : l10n.t('No changed files')}
+          </div>
         )}
 
         {!activeLoading && activeFiles.length > 0 && (
@@ -962,7 +993,7 @@ export function CommitDetail({ commit, fullMessage, range, files, selectedFile, 
             isFileSelected={f => selectedFile?.path === f.path}
             isFileContextActive={f => ctxMenu?.file.path === f.path}
             onOpenFile={f => openVscodeDiff(f, activeHash)}
-            onContextMenuFile={range ? undefined : (e, f) => setCtxMenu({ x: e.clientX, y: e.clientY, file: f })}
+            onContextMenuFile={inSelection ? undefined : (e, f) => setCtxMenu({ x: e.clientX, y: e.clientY, file: f })}
           />
         )}
       </div>
@@ -1114,6 +1145,21 @@ const styles = {
   rangeHint: {
     fontSize: '11px',
     opacity: 0.65,
+  } as React.CSSProperties,
+  rangeLabel: {
+    fontSize: '10px',
+    opacity: 0.6,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.04em',
+    width: '42px',
+    flexShrink: 0,
+  } as React.CSSProperties,
+  rangeMessage: {
+    fontSize: '12px',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap' as const,
+    minWidth: 0,
   } as React.CSSProperties,
   hashRow: {
     display: 'flex',

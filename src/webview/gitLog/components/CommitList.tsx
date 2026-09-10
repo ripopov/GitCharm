@@ -226,6 +226,9 @@ export function CommitList({ layout, selectedHash, repoColors: _repoColors, repo
   const closePopoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [multiSelectHashes, setMultiSelectHashes] = useState<Set<string>>(new Set());
+  // Row a Shift-click extends from: the last plain/Ctrl-clicked row (falls back to the selected row).
+  const anchorKeyRef = useRef<string | null>(null);
+  // In list (newest first) order — the order the host expects a selection in.
   const multiSelectedCommits = useMemo(
     () => commits.filter(c => multiSelectHashes.has(`${c.hash}:${c.repoId}`)),
     [commits, multiSelectHashes],
@@ -389,6 +392,7 @@ export function CommitList({ layout, selectedHash, repoColors: _repoColors, repo
       const centreOffset = el ? -Math.max(0, (el.clientHeight - ROW_HEIGHT) / 2) : 0;
       scrollToIndexExact(idx, centreOffset);
       setMultiSelectHashes(new Set());
+      anchorKeyRef.current = null;
       onSelect(commits[idx]);
       onScrollTargetHandled?.();
       return;
@@ -471,6 +475,8 @@ export function CommitList({ layout, selectedHash, repoColors: _repoColors, repo
     }
 
     setMultiSelectHashes(new Set());
+    // A later Shift-click extends from the row the keyboard moved to.
+    anchorKeyRef.current = null;
     onSelect(commits[nextIndex]);
   }, [commits, selectedHash, hoveredIndex, onSelect, scrollToIndexExact]);
 
@@ -593,10 +599,34 @@ export function CommitList({ layout, selectedHash, repoColors: _repoColors, repo
                 // an ancestor tabIndex on its own — grab it explicitly so arrow-key nav works
                 // immediately after clicking a commit, not just after clicking empty space.
                 parentRef.current?.focus();
+                const key = `${commit.hash}:${commit.repoId}`;
+                if (e.shiftKey) {
+                  // Select every visible row between the anchor and this row. Rows of
+                  // another repo, or stashes mixed with commits, are skipped so the
+                  // selection stays one the host can diff.
+                  const anchorKey = anchorKeyRef.current ?? selectedHash;
+                  const anchorIndex = anchorKey ? commits.findIndex(c => `${c.hash}:${c.repoId}` === anchorKey) : -1;
+                  if (anchorIndex < 0) {
+                    anchorKeyRef.current = key;
+                    setMultiSelectHashes(new Set());
+                    onSelect(commit);
+                    return;
+                  }
+                  const anchor = commits[anchorIndex];
+                  const from = Math.min(anchorIndex, vrow.index);
+                  const to = Math.max(anchorIndex, vrow.index);
+                  const next = new Set<string>();
+                  for (let i = from; i <= to; i++) {
+                    const c = commits[i];
+                    if (c.repoId === anchor.repoId && !!c.isStash === !!anchor.isStash) next.add(`${c.hash}:${c.repoId}`);
+                  }
+                  setMultiSelectHashes(next);
+                  return;
+                }
+                anchorKeyRef.current = key;
                 if (e.ctrlKey || e.metaKey) {
                   setMultiSelectHashes(prev => {
                     const next = new Set(prev);
-                    const key = `${commit.hash}:${commit.repoId}`;
                     // If starting a new multi-select, auto-include the currently single-selected commit
                     if (next.size === 0 && selectedHash && selectedHash !== key) {
                       // Find selected commit to check stash type and repo compatibility

@@ -16,6 +16,7 @@ import type {
 import type { StashEntry, UnpushedCommit } from '../types/messages';
 import { parseDiff, detectLanguage } from './DiffParser';
 import { getVscodeRepository } from './VscodeGitApi';
+import { getSelectionFiles, type SelectionFilesResult } from './selectionFiles';
 import { ForcePushMode, Status, RefType } from './git.d';
 
 const STATUS_MAP: Record<string, GitFileStatus> = {
@@ -905,6 +906,14 @@ export class GitService {
     const oldest = ordered[0];
     const newest = ordered[ordered.length - 1];
     return oldest && newest ? this._getFilesBetweenRefs(oldest, newest) : [];
+  }
+
+  /**
+   * Changed files of a multi-commit selection in the Git Log; `hashes` in log
+   * (newest first) order. See selectionFiles.ts for the strategy.
+   */
+  async getSelectionFiles(hashes: string[]): Promise<SelectionFilesResult> {
+    return getSelectionFiles(args => this.git.raw(args), hashes);
   }
 
   private async _getFilesBetweenRefs(base: string, newest: string): Promise<Array<{ path: string; status: string; added?: number; removed?: number; oldPath?: string }>> {
