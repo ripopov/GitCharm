@@ -123,7 +123,7 @@ async function maybeShowSupportNotification(globalState: vscode.Memento): Promis
   if (picked === doNotShow) {
     await globalState.update(DO_NOT_SHOW_KEY, true);
   } else if (picked === star) {
-    await vscode.env.openExternal(vscode.Uri.parse('https://github.com/RioNoir/GitCharm'));
+    await vscode.env.openExternal(vscode.Uri.parse('https://github.com/ripopov/GitCharm'));
   } else if (picked === support) {
     await vscode.env.openExternal(vscode.Uri.parse('https://ko-fi.com/rionoir'));
   }

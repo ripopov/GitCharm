@@ -2,7 +2,9 @@
   <img src="media/icons/gitcharm.png" alt="GitCharm" width="160">
 </p>
 
-<h1 align="center">GitCharm</h1>
+<h1 align="center">GitCharm Ultra</h1>
+
+<p align="center">Fork of <a href="https://github.com/RioNoir/GitCharm">RioNoir/GitCharm</a> (GPL-3.0), published as a separate extension id (<code>ripopov.gitcharm-ultra</code>) so it can be installed without replacing upstream GitCharm.</p>
 
 <p align="center">
   JetBrains-like Git management for VS Code.
