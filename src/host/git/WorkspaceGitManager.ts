@@ -51,8 +51,10 @@ export type { WorktreeEntry };
 export class WorkspaceGitManager implements vscode.Disposable {
   private repos = new Map<string, GitService>();
   private repoMetas = new Map<string, RepoMeta>();
-  /** Per-repo watchers, keyed by repoId — recreated on reinitialize(), or one repo at a time. */
+  /** Status and graph watchers per repo — recreated on reinitialize(), or one repo at a time. */
   private repoWatchers = new Map<string, vscode.Disposable[]>();
+  /** .gitmodules and worktree watchers — only ever recreated by reinitialize(). */
+  private auxWatchers: vscode.Disposable[] = [];
   /** Global workspace listeners — created once in constructor, disposed in dispose(). */
   private globalListeners: vscode.Disposable[] = [];
   private statusListeners: StatusListener[] = [];
@@ -386,7 +388,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
     gitmodulesWatcher.onDidChange(onGitmodulesChanged);
     gitmodulesWatcher.onDidCreate(onGitmodulesChanged);
     gitmodulesWatcher.onDidDelete(onGitmodulesChanged);
-    this.addWatcher(repoId, gitmodulesWatcher);
+    this.auxWatchers.push(gitmodulesWatcher);
 
     // Watch .git/worktrees/ so the panel updates when worktrees are added/removed.
     // Linked worktrees have .git as a file; their main repo owns .git/worktrees/.
@@ -405,7 +407,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
     worktreeWatcher.onDidChange(onWorktreesChanged);
     worktreeWatcher.onDidCreate(onWorktreesChanged);
     worktreeWatcher.onDidDelete(onWorktreesChanged);
-    this.addWatcher(repoId, worktreeWatcher);
+    this.auxWatchers.push(worktreeWatcher);
   }
 
   private repositoryScanDepth(workspaceRoot: string, candidatePath: string): number {
@@ -707,11 +709,11 @@ export class WorkspaceGitManager implements vscode.Disposable {
   /**
    * Request a working-tree status refresh for `repoIds`, or for every repository
    * when omitted. Requests are debounced and coalesced into one sweep at a time;
-   * see RefreshScope. A submodule's change also shows in its parent (the gitlink),
-   * so the parent is always swept along with it.
+   * see RefreshScope. A submodule's change also shows in every superproject above
+   * it (a moved gitlink or a dirty submodule), so those are swept along with it.
    */
   private scheduleRefresh(repoIds?: readonly string[]): void {
-    this.refreshScope.request(repoIds ? this.withParentRepos(repoIds) : undefined);
+    this.refreshScope.request(repoIds ? this.withSuperprojects(repoIds) : undefined);
     if (this.refreshDebounce) clearTimeout(this.refreshDebounce);
     this.refreshDebounce = setTimeout(() => {
       this.refreshDebounce = null;
@@ -719,11 +721,12 @@ export class WorkspaceGitManager implements vscode.Disposable {
     }, 300);
   }
 
-  private withParentRepos(repoIds: readonly string[]): string[] {
+  private withSuperprojects(repoIds: readonly string[]): string[] {
     const ids = new Set(repoIds);
     for (const id of repoIds) {
-      const parent = this.repoMetas.get(id)?.parentRepoId;
-      if (parent) ids.add(parent);
+      for (let parent = this.repoMetas.get(id)?.parentRepoId; parent && !ids.has(parent); parent = this.repoMetas.get(parent)?.parentRepoId) {
+        ids.add(parent);
+      }
     }
     return Array.from(ids);
   }
@@ -904,6 +907,8 @@ export class WorkspaceGitManager implements vscode.Disposable {
   private disposeWatchers(): void {
     for (const list of this.repoWatchers.values()) list.forEach(d => d.dispose());
     this.repoWatchers.clear();
+    this.auxWatchers.forEach(d => d.dispose());
+    this.auxWatchers = [];
     if (this.refreshDebounce) { clearTimeout(this.refreshDebounce); this.refreshDebounce = null; }
     if (this.refreshFollowUp) { clearTimeout(this.refreshFollowUp); this.refreshFollowUp = null; }
     if (this.branchDebounce) { clearTimeout(this.branchDebounce); this.branchDebounce = null; }
