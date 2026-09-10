@@ -1,7 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import simpleGit, { SimpleGit } from 'simple-git';
+import type { SimpleGit } from 'simple-git';
+import { createGit } from './gitEnv';
 import type { ShelveEntry } from '../types/messages';
 
 type ChangelistAssignment = NonNullable<ShelveEntry['changelistAssignments']>[number];
@@ -33,7 +34,7 @@ export class ShelveService {
   private metaPath: string;
 
   constructor(public readonly rootPath: string, globalStorage: string) {
-    this.git = simpleGit(rootPath);
+    this.git = createGit(rootPath);
     const repoHash = crypto.createHash('sha1').update(rootPath).digest('hex').slice(0, 16);
     this.shelfDir = path.join(globalStorage, 'shelves', repoHash);
     this.metaPath = path.join(this.shelfDir, META_FILE);

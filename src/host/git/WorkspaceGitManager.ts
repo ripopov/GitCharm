@@ -4,11 +4,18 @@ import * as path from 'path';
 import { GitService } from './GitService';
 import type { WorktreeEntry } from './GitService';
 import { getVscodeGitApi, getVscodeRepository } from './VscodeGitApi';
-import type { BranchInfo, CommitNode, RepoMeta, WorkspaceStatus } from '../types/git';
+import type { BranchInfo, CommitNode, RepoMeta, RepoStatus, WorkspaceStatus } from '../types/git';
 import { PROJECT_COLORS } from '../types/workspace';
 import { formatGitError } from '../utils/gitErrorUtils';
+import { RefreshScope, mergeRepoStatuses } from './refreshScope';
 
-const MAX_SUBMODULE_DEPTH = 5;
+/**
+ * Submodule nesting registered by default: direct submodules only. Recursing
+ * further (qemu → edk2 → openssl → its test vendors) turned one workspace into
+ * 45 repositories, each queried on every refresh.
+ */
+const DEFAULT_SUBMODULE_SCAN_MAX_DEPTH = 1;
+const MAX_SUBMODULE_SCAN_DEPTH = 5;
 /**
  * Debounce for ref changes that affect the commit graph (HEAD, refs, reflog).
  * Deliberately short: a single git operation writes a handful of these files
@@ -42,8 +49,8 @@ export type { WorktreeEntry };
 export class WorkspaceGitManager implements vscode.Disposable {
   private repos = new Map<string, GitService>();
   private repoMetas = new Map<string, RepoMeta>();
-  /** Per-repo watchers — recreated on reinitialize(). */
-  private watchers: vscode.Disposable[] = [];
+  /** Per-repo watchers, keyed by repoId — recreated on reinitialize(), or one repo at a time. */
+  private repoWatchers = new Map<string, vscode.Disposable[]>();
   /** Global workspace listeners — created once in constructor, disposed in dispose(). */
   private globalListeners: vscode.Disposable[] = [];
   private statusListeners: StatusListener[] = [];
@@ -53,6 +60,12 @@ export class WorkspaceGitManager implements vscode.Disposable {
   private worktreeListeners: WorktreeListener[] = [];
   private refreshDebounce: NodeJS.Timeout | null = null;
   private refreshFollowUp: NodeJS.Timeout | null = null;
+  /** Repositories whose status must be re-queried by the next sweep. */
+  private refreshScope = new RefreshScope();
+  /** One status sweep at a time; requests made meanwhile run in a single follow-up sweep. */
+  private refreshInFlight = false;
+  /** Last status per repo, so a scoped sweep can return a complete workspace status. */
+  private lastRepoStatuses = new Map<string, RepoStatus>();
   private branchDebounce: NodeJS.Timeout | null = null;
   private graphDebounce: NodeJS.Timeout | null = null;
   private lastGraphRefresh = 0;
@@ -75,13 +88,12 @@ export class WorkspaceGitManager implements vscode.Disposable {
 
       // File saved inside a repo → refresh status (immediate + follow-up for slow git index updates)
       vscode.workspace.onDidSaveTextDocument((doc) => {
-        const filePath = doc.uri.fsPath;
-        const inRepo = Array.from(this.repoMetas.values()).some(m => filePath.startsWith(m.rootPath));
-        if (inRepo) {
-          this.scheduleRefresh();
+        const owner = this.getServiceForFile(doc.uri.fsPath);
+        if (owner) {
+          this.scheduleRefresh([owner.repoId]);
           // Schedule a follow-up refresh in case git hasn't updated its index yet
           if (this.refreshFollowUp) clearTimeout(this.refreshFollowUp);
-          this.refreshFollowUp = setTimeout(() => this.scheduleRefresh(), 1200);
+          this.refreshFollowUp = setTimeout(() => this.scheduleRefresh([owner.repoId]), 1200);
         }
       }),
 
@@ -95,6 +107,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
         if (
           e.affectsConfiguration('gitcharm.repositoryScanMaxDepth') ||
           e.affectsConfiguration('gitcharm.repositoryScanIgnoredFolders') ||
+          e.affectsConfiguration('gitcharm.submoduleScanMaxDepth') ||
           e.affectsConfiguration('gitcharm.projectColors')
         ) {
           this.reinitialize();
@@ -108,13 +121,14 @@ export class WorkspaceGitManager implements vscode.Disposable {
       vscode.workspace.onDidChangeWorkspaceFolders(() => this.setupGitInitWatchers()),
     );
 
-    // VS Code's git extension can discover a repo (e.g. a parent-folder repo found via
-    // git.openRepositoryInParentFolders) asynchronously, after its API already reports
-    // 'initialized'. Pick those up as soon as they appear.
+    // VS Code's git extension opens repositories asynchronously, after its API already
+    // reports 'initialized': a parent-folder repo found via git.openRepositoryInParentFolders,
+    // and submodules one at a time. React per repository — a full reinitialize for each
+    // of ten submodules restarted every listener's work ten times over.
     const gitApiForOpenEvent = getVscodeGitApi();
     if (gitApiForOpenEvent) {
       this.globalListeners.push(
-        gitApiForOpenEvent.onDidOpenRepository(() => { this.reinitialize(); this.scheduleRefresh(); })
+        gitApiForOpenEvent.onDidOpenRepository(repo => this.onVscodeRepositoryOpened(repo.rootUri.fsPath))
       );
     }
 
@@ -178,6 +192,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
     this.disposeWatchers();
     this.repos.clear();
     this.repoMetas.clear();
+    this.lastRepoStatuses.clear();
     this.prevHeads.clear();
     this.prevCommits.clear();
     this.prevUntracked.clear();
@@ -233,6 +248,9 @@ export class WorkspaceGitManager implements vscode.Disposable {
     for (const vsRepo of gitApi.repositories) {
       const repoPath = path.normalize(vsRepo.rootUri.fsPath);
       if (this.repos.has(repoPath)) continue;
+      // Only the parent-folder case: repositories VS Code found *below* a workspace
+      // folder are nested repos or submodules the scans above deliberately left out.
+      if (!this.containsWorkspaceFolder(repoPath)) continue;
 
       const color = customColors[path.basename(repoPath)] ?? PROJECT_COLORS[colorIdx.value++ % PROJECT_COLORS.length];
       const { isWorktree, mainWorktreePath } = this.detectLinkedWorktree(repoPath);
@@ -252,6 +270,38 @@ export class WorkspaceGitManager implements vscode.Disposable {
       this.discoverSubmodules(repoPath, repoPath, 1, colorIdx, customColors);
       this.setupRepositoryAuxWatchers(repoPath, repoPath);
     }
+  }
+
+  private containsWorkspaceFolder(repoPath: string): boolean {
+    return (vscode.workspace.workspaceFolders ?? []).some(f =>
+      f.uri.fsPath === repoPath || f.uri.fsPath.startsWith(repoPath + path.sep));
+  }
+
+  /**
+   * VS Code's git extension opened a repository. For one we already track, only
+   * its event source changes: replace the FileSystemWatcher fallback with the API
+   * listener and re-read its status. Anything else that is not a parent of a
+   * workspace folder is a nested repo or submodule outside our configured depth.
+   */
+  private onVscodeRepositoryOpened(repoPath: string): void {
+    const normalized = path.normalize(repoPath);
+    if (this.repos.has(normalized)) {
+      this.disposeRepoWatchers(normalized);
+      this.setupWatcher(normalized, normalized);
+      this.scheduleRefresh([normalized]);
+      return;
+    }
+    if (!this.containsWorkspaceFolder(normalized)) return;
+    this.reinitialize();
+    this.scheduleRefresh();
+  }
+
+  private getSubmoduleScanMaxDepth(): number {
+    const value = vscode.workspace
+      .getConfiguration('gitcharm')
+      .get<number>('submoduleScanMaxDepth', DEFAULT_SUBMODULE_SCAN_MAX_DEPTH);
+    if (!Number.isFinite(value)) return DEFAULT_SUBMODULE_SCAN_MAX_DEPTH;
+    return Math.min(MAX_SUBMODULE_SCAN_DEPTH, Math.max(0, Math.floor(value)));
   }
 
   private getRepositoryScanMaxDepth(): number {
@@ -315,7 +365,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
     gitmodulesWatcher.onDidChange(onGitmodulesChanged);
     gitmodulesWatcher.onDidCreate(onGitmodulesChanged);
     gitmodulesWatcher.onDidDelete(onGitmodulesChanged);
-    this.watchers.push(gitmodulesWatcher);
+    this.addWatcher(repoId, gitmodulesWatcher);
 
     // Watch .git/worktrees/ so the panel updates when worktrees are added/removed.
     // Linked worktrees have .git as a file; their main repo owns .git/worktrees/.
@@ -334,7 +384,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
     worktreeWatcher.onDidChange(onWorktreesChanged);
     worktreeWatcher.onDidCreate(onWorktreesChanged);
     worktreeWatcher.onDidDelete(onWorktreesChanged);
-    this.watchers.push(worktreeWatcher);
+    this.addWatcher(repoId, worktreeWatcher);
   }
 
   private repositoryScanDepth(workspaceRoot: string, candidatePath: string): number {
@@ -437,7 +487,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
     colorIdx: { value: number },
     customColors: Record<string, string>,
   ): void {
-    if (depth > MAX_SUBMODULE_DEPTH) return;
+    if (depth > this.getSubmoduleScanMaxDepth()) return;
 
     const gitmodulesPath = path.join(parentPath, '.gitmodules');
     if (!fs.existsSync(gitmodulesPath)) return;
@@ -535,7 +585,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
    * that to the debounce below. The API listener is still used for working-tree
    * status, where its extra work is the point.
    */
-  private setupGraphWatcher(repoPath: string): void {
+  private setupGraphWatcher(repoPath: string, repoId: string): void {
     const dirs = this.resolveGitDirs(repoPath);
     if (!dirs) return;
     const { gitDir, commonDir } = dirs;
@@ -546,7 +596,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
       w.onDidChange(onGraphChanged);
       w.onDidCreate(onGraphChanged);
       w.onDidDelete(onGraphChanged);
-      this.watchers.push(w);
+      this.addWatcher(repoId, w);
     };
 
     // HEAD and the reflog live in the worktree's own git dir; a commit, reset,
@@ -563,7 +613,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
 
   private setupWatcher(repoPath: string, repoId: string): void {
     // Fast path for graph-affecting changes, independent of the VS Code Git API.
-    this.setupGraphWatcher(repoPath);
+    this.setupGraphWatcher(repoPath, repoId);
 
     // Primary source for working-tree status: VS Code Git API state changes —
     // fired for all git operations (built-in git, GitCharm, terminal, other
@@ -581,19 +631,19 @@ export class WorkspaceGitManager implements vscode.Disposable {
           // Branch checkout — fire both refresh and branch listeners.
           this.prevHeads.set(repoId, currentHead);
           this.prevCommits.set(repoId, currentCommit);
-          this.scheduleRefresh();
+          this.scheduleRefresh([repoId]);
           this.scheduleBranchRefresh();
         } else if (currentCommit !== prevCommit) {
           // New commit / pull / rebase — branch name unchanged but commit moved.
           // Fire branch listeners so the log panel refreshes.
           this.prevCommits.set(repoId, currentCommit);
-          this.scheduleRefresh();
+          this.scheduleRefresh([repoId]);
           this.scheduleBranchRefresh();
         } else {
-          this.scheduleRefresh();
+          this.scheduleRefresh([repoId]);
         }
       });
-      this.watchers.push(d);
+      this.addWatcher(repoId, d);
       // vsRepo.state.onDidChange covers git index changes but may miss rapid
       // working-tree edits that haven't been staged. Also watch saved documents
       // inside this repo — onDidSaveTextDocument is already set up in constructor.
@@ -603,8 +653,8 @@ export class WorkspaceGitManager implements vscode.Disposable {
     // Fallback: FileSystemWatcher when vscode.git is unavailable.
     // Watch .git/index (stage changes), .git/HEAD + refs (branch changes),
     // and all working-tree file creates/changes/deletes.
-    const onChanged = () => this.scheduleRefresh();
-    const onBranchChanged = () => { this.scheduleRefresh(); this.scheduleBranchRefresh(); };
+    const onChanged = () => this.scheduleRefresh([repoId]);
+    const onBranchChanged = () => { this.scheduleRefresh([repoId]); this.scheduleBranchRefresh(); };
 
     // .git internals
     const w1 = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(repoPath, '.git/index'));
@@ -619,16 +669,60 @@ export class WorkspaceGitManager implements vscode.Disposable {
     w3.onDidChange(onBranchChanged); w3.onDidCreate(onBranchChanged); w3.onDidDelete(onBranchChanged);
     w4.onDidCreate(onChanged); w4.onDidChange(onChanged); w4.onDidDelete(onChanged);
 
-    this.watchers.push(w1, w2, w3, w4);
+    for (const w of [w1, w2, w3, w4]) this.addWatcher(repoId, w);
   }
 
-  private scheduleRefresh(): void {
+  private addWatcher(repoId: string, watcher: vscode.Disposable): void {
+    const list = this.repoWatchers.get(repoId) ?? [];
+    list.push(watcher);
+    this.repoWatchers.set(repoId, list);
+  }
+
+  private disposeRepoWatchers(repoId: string): void {
+    this.repoWatchers.get(repoId)?.forEach(d => d.dispose());
+    this.repoWatchers.delete(repoId);
+  }
+
+  /**
+   * Request a working-tree status refresh for `repoIds`, or for every repository
+   * when omitted. Requests are debounced and coalesced into one sweep at a time;
+   * see RefreshScope. A submodule's change also shows in its parent (the gitlink),
+   * so the parent is always swept along with it.
+   */
+  private scheduleRefresh(repoIds?: readonly string[]): void {
+    this.refreshScope.request(repoIds ? this.withParentRepos(repoIds) : undefined);
     if (this.refreshDebounce) clearTimeout(this.refreshDebounce);
-    this.refreshDebounce = setTimeout(async () => {
-      const status = await this.getAllStatusesFresh();
+    this.refreshDebounce = setTimeout(() => {
+      this.refreshDebounce = null;
+      void this.runStatusRefresh();
+    }, 300);
+  }
+
+  private withParentRepos(repoIds: readonly string[]): string[] {
+    const ids = new Set(repoIds);
+    for (const id of repoIds) {
+      const parent = this.repoMetas.get(id)?.parentRepoId;
+      if (parent) ids.add(parent);
+    }
+    return Array.from(ids);
+  }
+
+  private async runStatusRefresh(): Promise<void> {
+    // The pending scope survives; the running sweep starts a follow-up when it ends.
+    if (this.refreshInFlight) return;
+    const scope = this.refreshScope.take();
+    if (!scope) return;
+    this.refreshInFlight = true;
+    try {
+      const status = await this.getAllStatusesFresh(scope.all ? undefined : scope.ids);
       this.detectNewUntrackedFiles(status);
       this.statusListeners.forEach(l => l(status));
-    }, 300);
+    } catch (e) {
+      console.error('GitCharm: status refresh failed', e);
+    } finally {
+      this.refreshInFlight = false;
+      if (this.refreshScope.isPending()) void this.runStatusRefresh();
+    }
   }
 
   reinitializeAndRefresh(): void {
@@ -685,7 +779,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
     for (const { repo, relPath } of files) {
       await repo.stageFiles([relPath]).catch(() => {});
     }
-    this.scheduleRefresh();
+    this.scheduleRefresh(files.map(f => f.repo.repoId));
   }
 
   /**
@@ -778,8 +872,8 @@ export class WorkspaceGitManager implements vscode.Disposable {
   }
 
   private disposeWatchers(): void {
-    this.watchers.forEach(d => d.dispose());
-    this.watchers = [];
+    for (const list of this.repoWatchers.values()) list.forEach(d => d.dispose());
+    this.repoWatchers.clear();
     if (this.refreshDebounce) { clearTimeout(this.refreshDebounce); this.refreshDebounce = null; }
     if (this.refreshFollowUp) { clearTimeout(this.refreshFollowUp); this.refreshFollowUp = null; }
     if (this.branchDebounce) { clearTimeout(this.branchDebounce); this.branchDebounce = null; }
@@ -867,30 +961,34 @@ export class WorkspaceGitManager implements vscode.Disposable {
   }
 
   async getAllStatuses(): Promise<WorkspaceStatus> {
-    const results = await Promise.allSettled(
-      Array.from(this.repos.values()).map(r => r.getStatus())
-    );
-    return {
-      repos: this.applySubmoduleStatus(
-        results
-          .filter((r): r is PromiseFulfilledResult<Awaited<ReturnType<GitService['getStatus']>>> => r.status === 'fulfilled')
-          .map(r => r.value)
-      ),
-    };
+    return this.collectStatuses(undefined, r => r.getStatus());
   }
 
-  /** Like getAllStatuses but forces VSCode's git extension to re-read from disk first. */
-  async getAllStatusesFresh(): Promise<WorkspaceStatus> {
-    const results = await Promise.allSettled(
-      Array.from(this.repos.values()).map(r => r.getStatusFresh())
-    );
-    return {
-      repos: this.applySubmoduleStatus(
-        results
-          .filter((r): r is PromiseFulfilledResult<Awaited<ReturnType<GitService['getStatus']>>> => r.status === 'fulfilled')
-          .map(r => r.value)
-      ),
-    };
+  /**
+   * Like getAllStatuses but reads status directly from git rather than from the
+   * VS Code API's cached state. With `repoIds`, only those repositories are queried;
+   * the rest reuse their last known status so the result still covers the workspace.
+   */
+  async getAllStatusesFresh(repoIds?: readonly string[]): Promise<WorkspaceStatus> {
+    return this.collectStatuses(repoIds, r => r.getStatusFresh());
+  }
+
+  private async collectStatuses(
+    repoIds: readonly string[] | undefined,
+    query: (repo: GitService) => Promise<RepoStatus>,
+  ): Promise<WorkspaceStatus> {
+    const order = Array.from(this.repos.keys());
+    const wanted = repoIds ? new Set(repoIds) : null;
+    // A repo never queried before has nothing to fall back on — query it regardless of scope.
+    const targets = order.filter(id => !wanted || wanted.has(id) || !this.lastRepoStatuses.has(id));
+    const results = await Promise.allSettled(targets.map(id => query(this.repos.get(id)!)));
+    const fresh = new Map<string, RepoStatus>();
+    results.forEach((r, i) => {
+      if (r.status !== 'fulfilled') return;
+      fresh.set(targets[i], r.value);
+      this.lastRepoStatuses.set(targets[i], r.value);
+    });
+    return { repos: this.applySubmoduleStatus(mergeRepoStatuses(order, fresh, this.lastRepoStatuses)) };
   }
 
   async getAllBranches(): Promise<BranchInfo[]> {

@@ -2,7 +2,7 @@
   "name": "gitcharm-ultra",
   "displayName": "GitCharm Ultra",
   "description": "Fork of GitCharm with a JetBrains-style Git Log. JetBrains-like Git management for VS Code — Commit panel, Git Log with graph, multi-repo support and more.",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "publisher": "ripopov",
   "license": "GPL-3.0-only",
   "repository": {
@@ -823,6 +823,14 @@
             "minimum": 0,
             "maximum": 10,
             "description": "Maximum depth of workspace subfolders to scan for Git repositories (0 = only workspace folders)."
+          },
+          "gitcharm.submoduleScanMaxDepth": {
+            "order": 65,
+            "type": "number",
+            "default": 1,
+            "minimum": 0,
+            "maximum": 5,
+            "description": "How many levels of submodules to show as repositories (0 = none, 1 = direct submodules only). Deeply nested submodule trees make every refresh query each one."
           },
           "gitcharm.repositoryScanIgnoredFolders": {
             "order": 70,

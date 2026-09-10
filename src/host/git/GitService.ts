@@ -1,4 +1,5 @@
-import simpleGit, { SimpleGit } from 'simple-git';
+import type { SimpleGit } from 'simple-git';
+import { createGit } from './gitEnv';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -54,7 +55,7 @@ export class GitService {
   private _pendingDetachedTag: string | undefined;
 
   constructor(public readonly repoId: string, public readonly rootPath: string) {
-    this.git = simpleGit(rootPath);
+    this.git = createGit(rootPath);
   }
 
   setPendingDetachedTag(tagName: string | undefined): void {
